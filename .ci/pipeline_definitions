@@ -20,11 +20,11 @@ etcd-druid:
                 build: ~
     steps:
       check:
-        image: 'golang:1.13'
+        image: 'eu.gcr.io/gardener-project/3rd/golang:1.15.8'
       test:
-        image: 'golang:1.13'
+        image: 'eu.gcr.io/gardener-project/3rd/golang:1.15.8'
       build:
-        image: 'golang:1.13'
+        image: 'eu.gcr.io/gardener-project/3rd/golang:1.15.8'
         output_dir: 'binary'
 
   jobs:
