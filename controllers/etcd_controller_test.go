@@ -20,13 +20,15 @@ import (
 	"os"
 	"time"
 
+	"github.com/gardener/gardener/pkg/utils/test/matchers"
+
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
-	"github.com/gardener/etcd-druid/pkg/common"
 	"github.com/gardener/gardener/pkg/utils/imagevector"
 	"github.com/ghodss/yaml"
 
 	druidv1alpha1 "github.com/gardener/etcd-druid/api/v1alpha1"
+	"github.com/gardener/etcd-druid/pkg/common"
 	"github.com/gardener/etcd-druid/pkg/utils"
 	"github.com/gardener/gardener/pkg/utils/kubernetes/health"
 	. "github.com/onsi/ginkgo"
@@ -141,9 +143,13 @@ func cmdIterator(element interface{}) string {
 var _ = Describe("Druid", func() {
 	//Reconciliation of new etcd resource deployment without any existing statefulsets.
 	Context("when adding etcd resources", func() {
-		var err error
-		var instance *druidv1alpha1.Etcd
-		var c client.Client
+		var (
+			err      error
+			instance *druidv1alpha1.Etcd
+			sts      *appsv1.StatefulSet
+			svc      *corev1.Service
+			c        client.Client
+		)
 
 		BeforeEach(func() {
 			instance = getEtcd("foo1", "default", false)
@@ -159,18 +165,91 @@ var _ = Describe("Druid", func() {
 			storeSecret := instance.Spec.Backup.Store.SecretRef.Name
 			errors := createSecrets(c, instance.Namespace, storeSecret)
 			Expect(len(errors)).Should(BeZero())
+			Expect(c.Create(context.TODO(), instance)).To(Succeed())
+
+			sts = &appsv1.StatefulSet{}
+			// Wait until StatefulSet has been created by controller
+			Eventually(func() error {
+				return c.Get(context.TODO(), types.NamespacedName{
+					Name:      instance.Name,
+					Namespace: instance.Namespace,
+				}, sts)
+			}, timeout, pollingInterval).Should(BeNil())
+
+			svc = &corev1.Service{}
+			// Wait until Service has been created by controller
+			Eventually(func() error {
+				return c.Get(context.TODO(), types.NamespacedName{
+					Name:      fmt.Sprintf("%s-client", instance.Name),
+					Namespace: instance.Namespace,
+				}, svc)
+			}, timeout, pollingInterval).Should(BeNil())
 		})
 		It("should create and adopt statefulset", func() {
-			defer WithWd("..")()
-			Expect(c.Create(context.TODO(), instance)).To(Succeed())
-			ss := appsv1.StatefulSet{}
-			Eventually(func() error { return statefulsetIsCorrectlyReconciled(c, instance, &ss) }, timeout, pollingInterval).Should(BeNil())
-			setStatefulSetReady(&ss)
-			err = c.Status().Update(context.TODO(), &ss)
+			setStatefulSetReady(sts)
+			err = c.Status().Update(context.TODO(), sts)
+			Eventually(func() error { return statefulsetIsCorrectlyReconciled(c, instance, sts) }, timeout, pollingInterval).Should(BeNil())
 			Expect(err).NotTo(HaveOccurred())
+		})
+		It("should create and adopt statefulset and printing events", func() {
+			// Check StatefulSet requirements
+			Expect(len(sts.Spec.VolumeClaimTemplates)).To(Equal(1))
+			Expect(sts.Spec.Replicas).To(PointTo(Equal(int32(1))))
+
+			// Create PVC
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("%s-%s-%d", sts.Spec.VolumeClaimTemplates[0].Name, sts.Name, 0),
+					Namespace: sts.Namespace,
+				},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("1Gi"),
+						},
+					},
+				},
+			}
+			Expect(c.Create(context.TODO(), pvc)).To(Succeed())
+
+			// Create PVC warning Event
+			pvcMessage := "Failed to provision volume"
+			Expect(c.Create(context.TODO(), &corev1.Event{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pvc-event-1",
+					Namespace: pvc.Namespace,
+				},
+				InvolvedObject: corev1.ObjectReference{
+					APIVersion: "v1",
+					Kind:       "PersistentVolumeClaim",
+					Name:       pvc.Name,
+					Namespace:  pvc.Namespace,
+				},
+				Type:    corev1.EventTypeWarning,
+				Message: pvcMessage,
+			})).To(Succeed())
+
+			// Eventually, warning message should be reflected in `etcd` object status.
+			Eventually(func() string {
+				if err := c.Get(context.TODO(), client.ObjectKeyFromObject(instance), instance); err != nil {
+					return ""
+				}
+				if instance.Status.LastError == nil {
+					return ""
+				}
+				return *instance.Status.LastError
+			}, timeout, pollingInterval).Should(ContainSubstring(pvcMessage))
 		})
 		AfterEach(func() {
 			Expect(c.Delete(context.TODO(), instance)).To(Succeed())
+			Eventually(func() error {
+				return c.Get(context.TODO(), client.ObjectKeyFromObject(instance), &druidv1alpha1.Etcd{})
+			}, timeout, pollingInterval).Should(matchers.BeNotFoundError())
+			Expect(c.Delete(context.TODO(), svc)).To(Succeed())
+			Eventually(func() error {
+				return c.Get(context.TODO(), client.ObjectKeyFromObject(svc), &corev1.Service{})
+			}, timeout, pollingInterval).Should(matchers.BeNotFoundError())
 		})
 	})
 
@@ -211,7 +290,6 @@ var _ = Describe("Druid", func() {
 			errors := createSecrets(c, instance.Namespace, storeSecret)
 			Expect(len(errors)).Should(BeZero())
 			Expect(c.Create(context.TODO(), ss)).To(Succeed())
-			defer WithWd("..")()
 			s := &appsv1.StatefulSet{}
 			Eventually(func() error { return statefulsetIsCorrectlyReconciled(c, instance, s) }, timeout, pollingInterval).Should(BeNil())
 			setStatefulSetReady(s)
@@ -258,7 +336,6 @@ var _ = Describe("Druid", func() {
 
 			})
 			It("should restart pod", func() {
-				defer WithWd("..")()
 				Expect(c.Create(context.TODO(), instance)).To(Succeed())
 				Eventually(func() error { return podDeleted(c, instance) }, timeout, pollingInterval).Should(BeNil())
 			})
@@ -310,7 +387,6 @@ var _ = Describe("Druid", func() {
 			errors := createSecrets(c, instance.Namespace, storeSecret)
 			Expect(len(errors)).Should(BeZero())
 			Expect(c.Create(context.TODO(), ss)).To(Succeed())
-			defer WithWd("..")()
 			Eventually(func() error { return statefulsetIsCorrectlyReconciled(c, instance, &sts) }, timeout, pollingInterval).Should(BeNil())
 			// This go-routine is to set that statefulset is ready manually as statefulset controller is absent for tests.
 			go func() {
@@ -343,7 +419,6 @@ var _ = Describe("Druid", func() {
 			var cm *corev1.ConfigMap
 			var svc *corev1.Service
 
-			defer WithWd("..")()
 			instance = generateEtcd(name, "default")
 			c = mgr.GetClient()
 			ns := corev1.Namespace{
